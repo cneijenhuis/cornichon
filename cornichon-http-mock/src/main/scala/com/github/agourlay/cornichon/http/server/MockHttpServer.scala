@@ -8,17 +8,21 @@ import org.http4s.HttpService
 import org.http4s.server.blaze.BlazeBuilder
 
 import scala.collection.JavaConverters._
+import scala.concurrent.Future
 import scala.util.Random
 
-class MockHttpServer(interface: Option[String], port: Option[Range], mockService: HttpService) extends HttpServer {
+class MockHttpServer(interface: Option[String], port: Option[Range], mockService: HttpService, maxRetries: Int = 5) extends HttpServer {
 
   private val selectedInterface = interface.getOrElse(bestInterface())
-  // TODO handle case of random port from range taken, retry?
-  private val selectedPort = port.fold(0)(r ⇒ Random.shuffle(r.toList).head)
+  private val randomPortOrder = port.fold(List(0))(r ⇒ Random.shuffle(r.toList))
 
-  def startServer() =
+  def startServer(): Future[(String, CloseableResource)] = {
+    startServerTryPorts(randomPortOrder).unsafeRunAsyncFuture()
+  }
+
+  def startServerTryPorts(ports: List[Int], retry: Int = 0): fs2.Task[(String, CloseableResource)] = {
     BlazeBuilder
-      .bindHttp(selectedPort, selectedInterface)
+      .bindHttp(ports.head, selectedInterface)
       .mountService(mockService, "/")
       .start
       .map { serverBinding ⇒
@@ -27,7 +31,16 @@ class MockHttpServer(interface: Option[String], port: Option[Range], mockService
           def stopResource() = Task.fromFuture(serverBinding.shutdown.unsafeRunAsyncFuture())
         }
         (fullAddress, closeable)
-      }.unsafeRunAsyncFuture()
+      }.handleWith {
+        case _: java.net.BindException if ports.length > 1 ⇒
+          startServerTryPorts(ports.tail, retry)
+        case _: java.net.BindException if retry < maxRetries ⇒
+          val sleepFor = retry + 1
+          println(s"Could not start server on any port. Retrying in $sleepFor seconds...")
+          Thread.sleep(1000 * sleepFor)
+          startServerTryPorts(randomPortOrder, retry + 1)
+      }
+  }
 
   private def bestInterface(): String =
     NetworkInterface.getNetworkInterfaces.asScala
